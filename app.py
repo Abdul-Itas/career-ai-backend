@@ -2,13 +2,10 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 import os
-import random
-import string
 import hashlib
 import hmac
 import base64
 import json
-import resend
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import psycopg
@@ -23,7 +20,6 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL = "llama-3.3-70b-versatile"
 DATABASE_URL = os.environ.get("DATABASE_URL")
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-this-secret-in-production")
 
 if not GROQ_API_KEY:
@@ -35,11 +31,6 @@ if not DATABASE_URL:
     print("⚠️ WARNING: DATABASE_URL not found!")
 else:
     print("✅ DATABASE_URL loaded")
-
-if not RESEND_API_KEY:
-    print("⚠️ WARNING: RESEND_API_KEY not found! OTP will be printed in logs only.")
-else:
-    print("✅ RESEND_API_KEY loaded")
 
 GROQ_HEADERS = {
     "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -61,9 +52,7 @@ def init_db():
             name VARCHAR(100) NOT NULL,
             email VARCHAR(255) UNIQUE NOT NULL,
             password VARCHAR(255) NOT NULL,
-            is_verified BOOLEAN DEFAULT FALSE,
-            otp_code VARCHAR(6),
-            otp_expires TIMESTAMPTZ,
+            is_verified BOOLEAN DEFAULT TRUE,
             created_at TIMESTAMPTZ DEFAULT NOW()
         );
     """)
@@ -79,7 +68,7 @@ def init_db():
     conn.commit()
     cur.close()
     conn.close()
-    print("✅ Database tables ready")
+    print("✅ Database tables ready (OTP removed)")
 
 # Run on startup
 try:
@@ -141,53 +130,6 @@ def hash_password(password: str) -> str:
 def check_password(password: str, hashed: str) -> bool:
     return hashlib.sha256(password.encode()).hexdigest() == hashed
 
-# ── Email OTP (Updated with Resend) ────────────────────────────
-def generate_otp() -> str:
-    return ''.join(random.choices(string.digits, k=6))
-
-def send_otp_email(to_email: str, name: str, otp: str) -> bool:
-    if not RESEND_API_KEY:
-        print(f"🔥 OTP for {to_email}: {otp}   (Resend not configured)")
-        return True  # Continue anyway in development
-
-    try:
-        resend.api_key = RESEND_API_KEY
-
-        html = f"""
-        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px">
-            <div style="background:linear-gradient(135deg,#6C63FF,#9C8FFF); border-radius:16px;padding:28px;text-align:center;margin-bottom:24px">
-                <h1 style="color:white;margin:0;font-size:28px">Career AI</h1>
-                <p style="color:rgba(255,255,255,0.85);margin:8px 0 0">Your AI Career Advisor</p>
-            </div>
-            <h2 style="color:#1A1A2E">Hi {name}! 👋</h2>
-            <p style="color:#4A4A6A;line-height:1.6">
-                Here is your verification code to complete your sign up:
-            </p>
-            <div style="background:#F6F5FF;border:2px solid #6C63FF;border-radius:12px; padding:24px;text-align:center;margin:24px 0">
-                <span style="font-size:42px;font-weight:800;letter-spacing:10px;color:#6C63FF"> {otp} </span>
-            </div>
-            <p style="color:#9E9EBF;font-size:13px">
-                This code expires in <strong>10 minutes</strong>.<br>
-                If you did not request this, you can safely ignore this email.
-            </p>
-        </div>
-        """
-
-        params = {
-            "from": "Career AI <onboarding@resend.dev>",
-            "to": [to_email],
-            "subject": f"{otp} is your Career AI verification code",
-            "html": html
-        }
-
-        response = resend.Emails.send(params)
-        print(f"✅ OTP email sent successfully to {to_email} (Resend ID: {response.get('id')})")
-        return True
-
-    except Exception as e:
-        print(f"❌ Resend email error: {e}")
-        return False
-
 # ── Groq helper ────────────────────────────────────────────────
 def call_groq(system_prompt: str, user_message: str, max_tokens: int = 800) -> str:
     payload = {
@@ -206,7 +148,7 @@ def call_groq(system_prompt: str, user_message: str, max_tokens: int = 800) -> s
     return resp.json()["choices"][0]["message"]["content"]
 
 # ════════════════════════════════════════════════════════════════
-# AUTH ENDPOINTS
+# AUTH ENDPOINTS (Simplified - No OTP)
 # ════════════════════════════════════════════════════════════════
 
 # ── POST /auth/signup ──────────────────────────────────────────
@@ -224,47 +166,34 @@ def signup():
     if "@" not in email:
         return jsonify({"error": "Invalid email address"}), 400
 
-    otp = generate_otp()
-    expires = datetime.now(timezone.utc) + timedelta(minutes=10)
-
     conn = get_db()
     cur = conn.cursor()
     try:
-        # Check if email exists and is verified
-        cur.execute("SELECT id, is_verified FROM users WHERE email = %s", (email,))
-        existing = cur.fetchone()
-
-        if existing and existing["is_verified"]:
+        # Check if email already exists
+        cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+        if cur.fetchone():
             return jsonify({"error": "An account with this email already exists"}), 409
 
         hashed = hash_password(password)
 
-        if existing:
-            # Resend OTP to unverified account
-            cur.execute("""
-                UPDATE users 
-                SET name=%s, password=%s, otp_code=%s, otp_expires=%s 
-                WHERE email=%s
-            """, (name, hashed, otp, expires, email))
-        else:
-            cur.execute("""
-                INSERT INTO users (name, email, password, otp_code, otp_expires)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (name, email, hashed, otp, expires))
+        cur.execute("""
+            INSERT INTO users (name, email, password, is_verified)
+            VALUES (%s, %s, %s, TRUE)
+        """, (name, email, hashed))
 
         conn.commit()
 
-        # Send OTP email
-        if not send_otp_email(email, name, otp):
-            print(f"⚠️ Email sending failed for {email}. OTP was: {otp}")
-            return jsonify({
-                "message": "Account created but email sending failed. Check server logs for OTP.",
-                "email": email
-            }), 201
+        # Get newly created user id
+        cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+        user = cur.fetchone()
+        user_id = user["id"]
+
+        token = create_jwt(user_id, email)
 
         return jsonify({
-            "message": f"OTP sent to {email}. Please check your inbox.",
-            "email": email
+            "message": "Account created successfully!",
+            "token": token,
+            "user": {"id": user_id, "name": name, "email": email}
         }), 201
 
     except Exception as e:
@@ -275,52 +204,6 @@ def signup():
         cur.close()
         conn.close()
 
-# ── POST /auth/verify-otp ──────────────────────────────────────
-@app.route("/auth/verify-otp", methods=["POST"])
-def verify_otp():
-    data = request.get_json(silent=True) or {}
-    email = data.get("email", "").strip().lower()
-    otp = data.get("otp", "").strip()
-
-    if not email or not otp:
-        return jsonify({"error": "Email and OTP are required"}), 400
-
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT id, name, otp_code, otp_expires FROM users WHERE email = %s
-        """, (email,))
-        user = cur.fetchone()
-
-        if not user:
-            return jsonify({"error": "Account not found"}), 404
-        if user["otp_code"] != otp:
-            return jsonify({"error": "Incorrect OTP code"}), 400
-        if datetime.now(timezone.utc) > user["otp_expires"]:
-            return jsonify({"error": "OTP has expired. Please sign up again."}), 400
-
-        # Mark as verified and clear OTP
-        cur.execute("""
-            UPDATE users 
-            SET is_verified=TRUE, otp_code=NULL, otp_expires=NULL 
-            WHERE email=%s
-        """, (email,))
-        conn.commit()
-
-        token = create_jwt(user["id"], email)
-        return jsonify({
-            "message": "Email verified successfully!",
-            "token": token,
-            "user": {"id": user["id"], "name": user["name"], "email": email}
-        })
-    except Exception as e:
-        conn.rollback()
-        print(f"OTP verify error: {e}")
-        return jsonify({"error": "Server error"}), 500
-    finally:
-        cur.close()
-        conn.close()
 
 # ── POST /auth/login ───────────────────────────────────────────
 @app.route("/auth/login", methods=["POST"])
@@ -336,18 +219,18 @@ def login():
     cur = conn.cursor()
     try:
         cur.execute("""
-            SELECT id, name, password, is_verified FROM users WHERE email = %s
+            SELECT id, name, password FROM users WHERE email = %s
         """, (email,))
         user = cur.fetchone()
 
         if not user:
             return jsonify({"error": "No account found with this email"}), 404
-        if not user["is_verified"]:
-            return jsonify({"error": "Please verify your email first"}), 403
+
         if not check_password(password, user["password"]):
             return jsonify({"error": "Incorrect password"}), 401
 
         token = create_jwt(user["id"], email)
+
         return jsonify({
             "message": "Login successful",
             "token": token,
@@ -360,40 +243,6 @@ def login():
         cur.close()
         conn.close()
 
-# ── POST /auth/resend-otp ──────────────────────────────────────
-@app.route("/auth/resend-otp", methods=["POST"])
-def resend_otp():
-    data = request.get_json(silent=True) or {}
-    email = data.get("email", "").strip().lower()
-
-    if not email:
-        return jsonify({"error": "Email is required"}), 400
-
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT name FROM users WHERE email=%s AND is_verified=FALSE", (email,))
-        user = cur.fetchone()
-        if not user:
-            return jsonify({"error": "Account not found or already verified"}), 404
-
-        otp = generate_otp()
-        expires = datetime.now(timezone.utc) + timedelta(minutes=10)
-
-        cur.execute("UPDATE users SET otp_code=%s, otp_expires=%s WHERE email=%s",
-                    (otp, expires, email))
-        conn.commit()
-
-        if not send_otp_email(email, user["name"], otp):
-            return jsonify({"error": "Failed to send email"}), 500
-
-        return jsonify({"message": "New OTP sent to your email"})
-    except Exception as e:
-        conn.rollback()
-        return jsonify({"error": str(e)}), 500
-    finally:
-        cur.close()
-        conn.close()
 
 # ════════════════════════════════════════════════════════════════
 # CHAT ENDPOINTS
@@ -405,6 +254,7 @@ def chat():
     user = get_current_user()
     data = request.get_json(silent=True) or {}
     user_message = data.get("message", "").strip()
+
     if not user_message:
         return jsonify({"error": "Missing or empty 'message' field"}), 400
 
@@ -435,6 +285,7 @@ def chat():
     except Exception as e:
         print(f"Chat error: {e}")
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/chat/history", methods=["GET"])
 def chat_history():
@@ -470,6 +321,7 @@ def chat_history():
         cur.close()
         conn.close()
 
+
 @app.route("/chat/history", methods=["DELETE"])
 def clear_history():
     user = get_current_user()
@@ -489,6 +341,7 @@ def clear_history():
         cur.close()
         conn.close()
 
+
 # ════════════════════════════════════════════════════════════════
 # CV REVIEW
 # ════════════════════════════════════════════════════════════════
@@ -496,6 +349,10 @@ CV_SYSTEM_PROMPT = """You are a professional CV reviewer with 10+ years of recru
 
 @app.route("/cv-review", methods=["POST"])
 def cv_review():
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Authentication required"}), 401
+
     data = request.get_json(silent=True) or {}
     cv_text = data.get("cv_text", "").strip()
 
@@ -514,11 +371,11 @@ def cv_review():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 # ════════════════════════════════════════════════════════════════
 # CAREERS
 # ════════════════════════════════════════════════════════════════
 CAREERS = [
-    # ... (your full CAREERS list remains 100% unchanged)
     {
         "id": "data_analyst",
         "title": "Data Analyst",
