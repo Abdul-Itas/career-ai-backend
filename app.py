@@ -254,9 +254,13 @@ def signup():
         conn.commit()
 
         # Send OTP email
-        if not send_otp_email(email, name, otp):
-            return jsonify({"error": "Failed to send OTP email. Check your email address."}), 500
+        print(f"🔥 OTP for {email}: {otp}")  # TEMP: print instead of email
 
+        return jsonify({
+            "message": f"OTP generated (check logs).",
+            "email": email
+        }), 201
+        
         return jsonify({
             "message": f"OTP sent to {email}. Please check your inbox.",
             "email": email
