@@ -13,8 +13,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+
 
 load_dotenv()
 
@@ -48,7 +48,7 @@ GROQ_HEADERS = {
 
 # ── Database ───────────────────────────────────────────────────
 def get_db():
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    conn = psycopg.connect(DATABASE_URL, row_factory=psycopg.rows.dict_row)
     return conn
 
 
